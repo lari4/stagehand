@@ -562,3 +562,239 @@ private buildSystemPrompt(
   return `You are a web automation assistant using browser automation tools to accomplish the user's goal.\n\nYour task: ${executionInstruction}\n\nYou have access to various browser automation tools. Use them step by step to complete the task.\n\nIMPORTANT GUIDELINES:\n1. Always start by understanding the current page state\n2. Use the screenshot tool to verify page state when needed\n3. Use appropriate tools for each action\n4. When the task is complete, use the "close" tool with taskComplete: true\n5. If the task cannot be completed, use "close" with taskComplete: false\n\nTOOLS OVERVIEW:\n- screenshot: Take a PNG screenshot for quick visual context (use sparingly)\n- ariaTree: Get an accessibility (ARIA) hybrid tree for full page context\n- act: Perform a specific atomic action (click, type, etc.)\n- extract: Extract structured data\n- goto: Navigate to a URL\n- wait/navback/refresh: Control timing and navigation\n- scroll: Scroll the page x pixels up or down\n\nSTRATEGY:\n- Prefer ariaTree to understand the page before acting; use screenshot for confirmation.\n- Keep actions atomic and verify outcomes before proceeding.`;
 }
 ```
+
+---
+
+## Tool Description Prompts
+
+These prompts are embedded in tool definitions and guide the agent on when and how to use each tool.
+
+### 1. Act Tool Description
+
+**Purpose:** Guides the agent to perform page actions (click, type) with short, specific element descriptions.
+
+**Location:** `packages/core/lib/v3/agent/tools/v3-act.ts:8-15`
+
+**Tool Description:**
+- "Perform an action on the page (click, type). Provide a short, specific phrase that mentions the element type."
+
+**Input Schema Description:**
+- 'Describe what to click or type, e.g. "click the Login button" or "type "John" into the first name input"'
+
+**Code:**
+```typescript
+tool({
+  description:
+    "Perform an action on the page (click, type). Provide a short, specific phrase that mentions the element type.",
+  inputSchema: z.object({
+    action: z
+      .string()
+      .describe(
+        'Describe what to click or type, e.g. "click the Login button" or "type "John" into the first name input"',
+      ),
+  }),
+  // ... execute implementation
+})
+```
+
+### 2. Extract Tool Description
+
+**Purpose:** Guides the agent on structured data extraction with emphasis on minimal schemas and proper usage scenarios.
+
+**Location:** `packages/core/lib/v3/agent/tools/v3-extract.ts:28-45`
+
+**Key Guidelines:**
+- Keep schemas MINIMAL - only include essential fields
+- **IMPORTANT:** Only use if explicitly asked for structured output
+- In most scenarios, use aria tree tool instead
+- For links, ensure type definition follows `z.string().url()` format
+
+**Usage Examples Provided:**
+1. **Single value:** Extract product price with `z.object({ price: z.number()})`
+2. **Multiple fields:** Extract name and price
+3. **Arrays:** Extract all products with nested objects
+
+**Code:**
+```typescript
+tool({
+  description: `Extract structured data from the current page based on a provided schema.
+
+  USAGE GUIDELINES:
+  - Keep schemas MINIMAL - only include fields essential for the task
+  - IMPORANT: only use this if explicitly asked for structured output. In most scenarios, you should use the aria tree tool over this.
+  - If you need to extract a link, make sure the type defintion follows the format of z.string().url()
+  EXAMPLES:
+  1. Extract a single value:
+     instruction: "extract the product price"
+     schema: "z.object({ price: z.number()})"
+
+  2. Extract multiple fields:
+     instruction: "extract product name and price"
+     schema: "z.object({ name: z.string(), price: z.number() })"
+
+  3. Extract arrays:
+     instruction: "extract all product names and prices"
+     schema: "z.object({ products: z.array(z.object({ name: z.string(), price: z.number() })) })"`,
+  inputSchema: z.object({
+    instruction: z.string(),
+    schema: z
+      .string()
+      .optional()
+      .describe("Zod schema as code, e.g. z.object({ title: z.string() })"),
+  }),
+  // ... execute implementation
+})
+```
+
+### 3. Close Tool Description
+
+**Purpose:** Signals task completion or termination to the agent.
+
+**Location:** `packages/core/lib/v3/agent/tools/v3-close.ts:6-12`
+
+**Input Parameters:**
+- `reasoning` - Summary of what was accomplished
+- `taskComplete` - Boolean indicating successful completion
+
+**Code:**
+```typescript
+tool({
+  description: "Complete the task and close",
+  inputSchema: z.object({
+    reasoning: z.string().describe("Summary of what was accomplished"),
+    taskComplete: z
+      .boolean()
+      .describe("Whether the task was completed successfully"),
+  }),
+  // ... execute implementation
+})
+```
+
+### 4. Aria Tree Tool Description
+
+**Purpose:** Retrieves the accessibility (ARIA) hybrid tree to understand page structure and content.
+
+**Location:** `packages/core/lib/v3/agent/tools/v3-ariaTree.ts:7-8`
+
+**Key Features:**
+- Gets hybrid tree combining DOM and accessibility tree
+- Use to understand structure and content
+- Truncates if exceeds 70,000 token limit (conservative estimate: ~280k chars)
+
+**Code:**
+```typescript
+tool({
+  description:
+    "gets the accessibility (ARIA) hybrid tree text for the current page. use this to understand structure and content.",
+  inputSchema: z.object({}),
+  execute: async () => {
+    // ... fetches page text and truncates if needed
+    const MAX_TOKENS = 70000;
+    const estimatedTokens = Math.ceil(content.length / 4);
+    if (estimatedTokens > MAX_TOKENS) {
+      const maxChars = MAX_TOKENS * 4;
+      content =
+        content.substring(0, maxChars) +
+        "\n\n[CONTENT TRUNCATED: Exceeded 70,000 token limit]";
+    }
+    return { content, pageUrl };
+  },
+})
+```
+
+---
+
+## Evaluator Prompts
+
+### 1. Default Evaluation System Prompt
+
+**Purpose:** Evaluates whether a task goal was achieved based on screenshot and/or agent reasoning.
+
+**Location:** `packages/core/lib/v3Evaluator.ts:85`
+
+**Key Features:**
+- Expert evaluator that confidently returns YES or NO
+- Access to screenshot and/or agent reasoning
+- Provides detailed reasoning for answer
+- Includes current date context
+
+**Code:**
+```typescript
+const defaultSystemPrompt = `You are an expert evaluator that confidently returns YES or NO based on if the original goal was achieved. You have access to  ${screenshot ? "a screenshot" : "the agents reasoning and actions throughout the task"} that you can use to evaluate the tasks completion. Provide detailed reasoning for your answer.
+          Today's date is ${new Date().toLocaleDateString()}`;
+```
+
+### 2. Batch Evaluation System Prompt
+
+**Purpose:** Evaluates multiple questions simultaneously with YES/NO responses for each.
+
+**Location:** `packages/core/lib/v3Evaluator.ts:151-183`
+
+**Key Features:**
+- Handles multiple questions in one call
+- Can include screenshot for all questions
+- Returns JSON array with one object per question
+- Maintains question order in response
+
+**Code:**
+```typescript
+const systemPrompt = `${baseSystemPrompt}\n\nYou will be given multiple questions${screenshot ? " with a screenshot" : ""}. ${questions.some((q) => q.answer) ? "Some questions include answers to evaluate." : ""} Answer each question by returning an object in the specified JSON format. Return a single JSON array containing one object for each question in the order they were asked.`;
+```
+
+### 3. Multi-Screenshot Evaluation System Prompt
+
+**Purpose:** Evaluates task completion across multiple screenshots showing task progression.
+
+**Location:** `packages/core/lib/v3Evaluator.ts:237-242`
+
+**Key Features:**
+- Analyzes ALL screenshots to understand complete journey
+- Looks for evidence across entire sequence (not just last screenshot)
+- Success criteria may appear at different points (confirmations, intermediate states)
+- Can include agent reasoning for comprehensive evaluation
+- Emphasizes understanding complete progression
+
+**Code:**
+```typescript
+const systemPrompt = `You are an expert evaluator that confidently returns YES or NO given a question and multiple screenshots showing the progression of a task.
+        ${agentReasoning ? "You also have access to the agent's detailed reasoning and thought process throughout the task." : ""}
+        Analyze ALL screenshots to understand the complete journey. Look for evidence of task completion across all screenshots, not just the last one.
+        Success criteria may appear at different points in the sequence (confirmation messages, intermediate states, etc).
+        ${agentReasoning ? "The agent's reasoning provides crucial context about what actions were attempted, what was observed, and the decision-making process. Use this alongside the visual evidence to make a comprehensive evaluation." : ""}
+        Today's date is ${new Date().toLocaleDateString()}`;
+```
+
+### 4. Multi-Screenshot User Prompt
+
+**Purpose:** Formats question, agent reasoning, and multiple screenshots for evaluation.
+
+**Location:** `packages/core/lib/v3Evaluator.ts:270-278`
+
+**Key Features:**
+- Clearly states number of screenshots provided
+- Includes agent reasoning if available
+- Asks for analysis of both reasoning and all screenshots
+
+**Code:**
+```typescript
+const userContent = agentReasoning
+  ? `Question: ${question}\n\nAgent's reasoning and actions throughout the task:\n${agentReasoning}\n\nI'm providing ${screenshots.length} screenshots showing the progression of the task. Please analyze both the agent's reasoning and all screenshots to determine if the task was completed successfully.`
+  : `${question}\n\nI'm providing ${screenshots.length} screenshots showing the progression of the task. Please analyze all of them to determine if the task was completed successfully.`;
+```
+
+---
+
+## Summary
+
+This documentation covers all AI prompts used in the Stagehand browser automation system, organized by functional category:
+
+1. **Extract Operation Prompts** - Content extraction from DOM elements
+2. **Observe Operation Prompts** - Finding multiple elements on pages
+3. **Act Operation Prompts** - Performing actions on single elements
+4. **Agent/Operator Prompts** - Multi-step goal orchestration
+5. **Computer Use Agent Prompts** - CUA-specific system instructions
+6. **V3 Agent Handler Prompts** - Agent execution system prompts
+7. **Tool Description Prompts** - Embedded guidance for tool usage
+8. **Evaluator Prompts** - Task completion evaluation
+
+Each prompt is designed for a specific purpose in the automation pipeline, working together to enable sophisticated browser automation through AI agents.
