@@ -169,3 +169,70 @@ Extracted content: ${JSON.stringify(extractionResponse, null, 2)}`,
 }
 ```
 
+---
+
+## Observe Operation Prompts
+
+### 1. Observe System Prompt (`buildObserveSystemPrompt`)
+
+**Purpose:** Instructs the AI to find elements on a page based on user's observation intent. Used to locate multiple elements that match a description without performing actions on them.
+
+**Location:** `packages/core/lib/prompt.ts:111-130`
+
+**Parameters:**
+- `userProvidedInstructions` (optional string): Custom instructions from the user
+
+**Key Features:**
+- Helps automate the browser by finding elements based on observation needs
+- Works with hierarchical accessibility tree (hybrid of DOM and accessibility tree)
+- Returns an array of matching elements (or empty array if none found)
+- Supports custom user instructions
+
+**Code:**
+```typescript
+export function buildObserveSystemPrompt(
+  userProvidedInstructions?: string,
+): ChatMessage {
+  const observeSystemPrompt = `
+You are helping the user automate the browser by finding elements based on what the user wants to observe in the page.
+
+You will be given:
+1. a instruction of elements to observe
+2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.
+
+Return an array of elements that match the instruction if they exist, otherwise return an empty array.`;
+  const content = observeSystemPrompt.replace(/\s+/g, " ");
+
+  return {
+    role: "system",
+    content: [content, buildUserInstructionsString(userProvidedInstructions)]
+      .filter(Boolean)
+      .join("\n\n"),
+  };
+}
+```
+
+### 2. Observe User Message (`buildObserveUserMessage`)
+
+**Purpose:** Formats the user's observation instruction and accessibility tree data into a user message for the LLM.
+
+**Location:** `packages/core/lib/prompt.ts:132-141`
+
+**Parameters:**
+- `instruction` (string): What elements to observe
+- `domElements` (string): The accessibility tree representation of the page
+
+**Code:**
+```typescript
+export function buildObserveUserMessage(
+  instruction: string,
+  domElements: string,
+): ChatMessage {
+  return {
+    role: "user",
+    content: `instruction: ${instruction}
+Accessibility Tree: \n${domElements}\n`,
+  };
+}
+```
+
