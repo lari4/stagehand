@@ -794,3 +794,386 @@ await stagehand.act("scroll halfway down the page");
 await stagehand.act("click the dynamic button", { selfHeal: true });
 ```
 
+
+---
+
+## V3 Agent Execution Pipeline
+
+**Purpose:** Autonomous agent that accomplishes complex multi-step goals by orchestrating multiple tools (act, extract, goto, etc.) until task completion.
+
+**Entry Point:** `V3AgentHandler.execute()` in `packages/core/lib/v3/handlers/v3AgentHandler.ts`
+
+### Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    V3 AGENT EXECUTION PIPELINE                       │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: agent.execute(instruction)
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Build System Prompt                                         │
+│ Location: v3AgentHandler.ts:58-61 → buildSystemPrompt()             │
+│                                                                      │
+│ IF custom systemInstructions provided:                              │
+│    "${systemInstructions}\n                                         │
+│     Your current goal: ${executionInstruction}                      │
+│     when the task is complete, use the 'close' tool with           │
+│     taskComplete: true"                                              │
+│                                                                      │
+│ ELSE (Default System Prompt):                                       │
+│    "You are a web automation assistant using browser automation    │
+│     tools to accomplish the user's goal.                            │
+│                                                                      │
+│     Your task: ${executionInstruction}                              │
+│                                                                      │
+│     You have access to various browser automation tools. Use       │
+│     them step by step to complete the task.                         │
+│                                                                      │
+│     IMPORTANT GUIDELINES:                                            │
+│     1. Always start by understanding the current page state         │
+│     2. Use the screenshot tool to verify page state when needed     │
+│     3. Use appropriate tools for each action                         │
+│     4. When the task is complete, use the 'close' tool with         │
+│        taskComplete: true                                            │
+│     5. If the task cannot be completed, use 'close' with            │
+│        taskComplete: false                                           │
+│                                                                      │
+│     TOOLS OVERVIEW:                                                  │
+│     - screenshot: Take a PNG screenshot for quick visual context    │
+│       (use sparingly)                                                │
+│     - ariaTree: Get an accessibility (ARIA) hybrid tree for full   │
+│       page context                                                   │
+│     - act: Perform a specific atomic action (click, type, etc.)     │
+│     - extract: Extract structured data                               │
+│     - goto: Navigate to a URL                                        │
+│     - wait/navback/refresh: Control timing and navigation           │
+│     - scroll: Scroll the page x pixels up or down                   │
+│                                                                      │
+│     STRATEGY:                                                        │
+│     - Prefer ariaTree to understand the page before acting; use     │
+│       screenshot for confirmation.                                   │
+│     - Keep actions atomic and verify outcomes before proceeding."   │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Create Tools                                                │
+│ Location: v3AgentHandler.ts:62 → createAgentTools()                 │
+│                                                                      │
+│ Available Tools (from lib/v3/agent/tools/):                         │
+│                                                                      │
+│ ┌─────────────────┬──────────────────────────────────────┐         │
+│ │ Tool            │ Description                          │         │
+│ ├─────────────────┼──────────────────────────────────────┤         │
+│ │ act             │ Perform page action (click, type)    │         │
+│ │ ariaTree        │ Get accessibility tree               │         │
+│ │ close           │ Signal task completion               │         │
+│ │ extract         │ Extract structured data              │         │
+│ │ fillForm        │ Fill multiple form fields            │         │
+│ │ goto            │ Navigate to URL                      │         │
+│ │ navback         │ Go back to previous page             │         │
+│ │ screenshot      │ Take PNG screenshot                  │         │
+│ │ scroll          │ Scroll page up or down               │         │
+│ │ wait            │ Wait for time period                 │         │
+│ └─────────────────┴──────────────────────────────────────┘         │
+│                                                                      │
+│ + MCP Tools (if provided): Custom tools from Model Context Protocol │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Initialize Messages                                         │
+│ Location: v3AgentHandler.ts:64-66                                   │
+│                                                                      │
+│ messages = [                                                         │
+│   { role: "user", content: instruction }                            │
+│ ]                                                                    │
+│                                                                      │
+│ → Processed through middleware for formatting                       │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: LLM Generate Text Loop (Tool Calling)                       │
+│ Location: v3AgentHandler.ts:82-138                                  │
+│                                                                      │
+│ Configuration:                                                       │
+│   - model: wrappedModel (with message processing middleware)        │
+│   - system: systemPrompt (from Step 1)                              │
+│   - messages: conversation history                                  │
+│   - tools: all tools (from Step 2)                                  │
+│   - stopWhen: stepCountIs(maxSteps) // default: 10                  │
+│   - temperature: 1                                                   │
+│   - toolChoice: "auto"                                               │
+│                                                                      │
+│ ┌───────────────────────────────────────────────────────┐          │
+│ │ EXECUTION LOOP (up to maxSteps)                       │          │
+│ │                                                        │          │
+│ │ Loop Iteration:                                        │          │
+│ │      │                                                 │          │
+│ │      ├──► LLM Call with current conversation           │          │
+│ │      │                                                 │          │
+│ │      ├──► LLM Returns:                                 │          │
+│ │      │    - Text (reasoning/thinking)                  │          │
+│ │      │    - Tool calls (0 or more)                     │          │
+│ │      │                                                 │          │
+│ │      ├──► onStepFinish callback triggers:              │          │
+│ │      │                                                 │          │
+│ │      │    ┌─────────────────────────────────────┐     │          │
+│ │      │    │ For each tool call:                 │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │ 1. Extract tool name & arguments    │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │ 2. IF reasoning text:                │     │          │
+│ │      │    │    → Collect for final message      │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │ 3. IF tool is "close":               │     │          │
+│ │      │    │    → Set completed = true            │     │          │
+│ │      │    │    → Extract final message           │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │ 4. Execute tool:                     │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │    Example - ariaTree tool:          │     │          │
+│ │      │    │      → Call v3.extract()             │     │          │
+│ │      │    │      → Get pageText                  │     │          │
+│ │      │    │      → Truncate if > 70k tokens      │     │          │
+│ │      │    │      → Return tree text              │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │    Example - act tool:               │     │          │
+│ │      │    │      → Call v3.act(action)           │     │          │
+│ │      │    │      → Extract resulting actions     │     │          │
+│ │      │    │      → Record for agent replay       │     │          │
+│ │      │    │      → Return success/error          │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │    Example - screenshot tool:        │     │          │
+│ │      │    │      → Take page screenshot          │     │          │
+│ │      │    │      → Return base64 PNG             │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │ 5. Map tool result to AgentAction   │     │          │
+│ │      │    │    → Add pageUrl, timestamp          │     │          │
+│ │      │    │    → Append to actions array         │     │          │
+│ │      │    │                                      │     │          │
+│ │      │    │ 6. Tool result added to              │     │          │
+│ │      │    │    conversation automatically        │     │          │
+│ │      │    └─────────────────────────────────────┘     │          │
+│ │      │                                                 │          │
+│ │      ├──► IF completed OR maxSteps reached:            │          │
+│ │      │    → Exit loop                                  │          │
+│ │      │                                                 │          │
+│ │      └──► ELSE: Continue to next iteration             │          │
+│ │           (LLM sees tool results in next call)         │          │
+│ └───────────────────────────────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Build Final Result                                          │
+│ Location: v3AgentHandler.ts:140-168                                 │
+│                                                                      │
+│ IF no finalMessage yet:                                              │
+│    → Combine all reasoning text from steps                          │
+│    → OR use last LLM response text                                  │
+│                                                                      │
+│ Calculate inference time                                             │
+│ Update metrics (tokens, time)                                        │
+│                                                                      │
+│ Return: {                                                            │
+│   success: completed,        // true if close tool called           │
+│   message: finalMessage,     // Combined reasoning                  │
+│   actions: AgentAction[],    // All actions taken                   │
+│   completed: boolean,         // Task completion status              │
+│   usage: {                                                           │
+│     input_tokens: number,                                            │
+│     output_tokens: number,                                           │
+│     inference_time_ms: number                                        │
+│   }                                                                  │
+│ }                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Message Flow Example
+
+**Task:** "Find the price of the first product on the page"
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ITERATION 1                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+INPUT:
+  System: [agent instructions with tools overview]
+  User: "Find the price of the first product on the page"
+
+LLM OUTPUT:
+  Reasoning: "I need to first understand the page structure"
+  Tool Call: ariaTree()
+
+TOOL EXECUTION:
+  → ariaTree executes → Returns accessibility tree
+
+CONVERSATION UPDATE:
+  + Assistant: [reasoning + ariaTree tool call]
+  + User: [tool result with tree text]
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ ITERATION 2                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+INPUT:
+  [Previous conversation + tool result]
+
+LLM OUTPUT:
+  Reasoning: "I can see products in the tree. I'll extract the first 
+             product's price"
+  Tool Call: extract({
+    instruction: "extract first product price",
+    schema: "z.object({ price: z.number() })"
+  })
+
+TOOL EXECUTION:
+  → extract executes → Returns { price: 29.99 }
+
+CONVERSATION UPDATE:
+  + Assistant: [reasoning + extract tool call]
+  + User: [tool result with extracted data]
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ ITERATION 3                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+INPUT:
+  [Previous conversation + extraction result]
+
+LLM OUTPUT:
+  Reasoning: "I found the price: $29.99"
+  Tool Call: close({
+    reasoning: "Successfully found the first product price: $29.99",
+    taskComplete: true
+  })
+
+TOOL EXECUTION:
+  → close executes → Sets completed=true
+
+RESULT:
+  {
+    success: true,
+    completed: true,
+    message: "I need to first understand the page structure. I can 
+             see products in the tree. I'll extract the first product's
+             price. I found the price: $29.99. Successfully found the 
+             first product price: $29.99",
+    actions: [
+      { type: "extract", ... },
+    ],
+    usage: { input_tokens: 1523, output_tokens: 234, ... }
+  }
+```
+
+### Tool Execution Details
+
+#### ariaTree Tool
+```typescript
+Input: (none)
+Process:
+  1. Call v3.extract() without instruction
+  2. Get pageText from accessibility tree
+  3. Estimate tokens (length / 4)
+  4. If > 70,000 tokens: truncate with warning
+  5. Return { content: treeText, pageUrl }
+Output: Full page structure as text
+```
+
+#### act Tool
+```typescript
+Input: { action: "click the Login button" }
+Process:
+  1. Log tool invocation
+  2. Call v3.act(action, { model: executionModel })
+  3. Extract resulting Playwright actions
+  4. Record step for agent replay
+  5. Return { success, action, playwrightArguments }
+Output: Action result
+```
+
+#### extract Tool
+```typescript
+Input: { 
+  instruction: "extract product name",
+  schema: "z.object({ name: z.string() })"
+}
+Process:
+  1. Evaluate schema string (create Zod object)
+  2. Call v3.extract(instruction, schema, { model })
+  3. Return { success: true, result: extractedData }
+Output: Structured data matching schema
+```
+
+#### close Tool
+```typescript
+Input: { 
+  reasoning: "Task completed successfully",
+  taskComplete: true
+}
+Process:
+  1. Return immediately (signal only)
+  2. Agent handler detects close call
+  3. Sets completed flag
+  4. Exits loop
+Output: { success: true, reasoning, taskComplete }
+```
+
+### Key Features
+
+1. **Autonomous Operation**
+   - No human in the loop during execution
+   - Agent decides which tools to use and when
+   - Continues until task complete or max steps
+
+2. **Tool Orchestration**
+   - Multiple tools available simultaneously
+   - LLM chooses appropriate tool for each step
+   - Results from one tool inform next decision
+
+3. **Reasoning Collection**
+   - All reasoning/thinking text collected
+   - Combined into final message for user
+   - Provides transparency into agent's thought process
+
+4. **State Management**
+   - Conversation history maintained across steps
+   - Each tool result added to context
+   - LLM has full history for decision making
+
+5. **Flexible Completion**
+   - Agent signals completion with close tool
+   - Can indicate success or failure
+   - Provides reasoning for outcome
+
+### Key Files
+
+- **Handler:** `packages/core/lib/v3/handlers/v3AgentHandler.ts`
+- **Tools:** `packages/core/lib/v3/agent/tools/` (all v3-*.ts files)
+- **Tool Creation:** `packages/core/lib/v3/agent/tools/index.ts`
+- **Message Processing:** `packages/core/lib/v3/agent/utils/messageProcessing.ts`
+- **Action Mapping:** `packages/core/lib/v3/agent/utils/actionMapping.ts`
+
+### Usage Example
+
+```typescript
+const agent = await stagehand.agent({
+  systemInstructions: "You are a helpful shopping assistant",
+  maxSteps: 10
+});
+
+const result = await agent.execute(
+  "Go to example.com, find the first product, and extract its name and price"
+);
+
+console.log(result.message);    // Agent's reasoning
+console.log(result.completed);  // true if task completed
+console.log(result.actions);    // All actions taken
+```
+
