@@ -457,3 +457,340 @@ const result = await stagehand.observe("find all buttons on the page");
 // }
 ```
 
+
+---
+
+## Act Pipeline
+
+**Purpose:** Find a single element and perform an action on it (click, type, etc.). Supports complex scenarios like two-step dropdowns and self-healing when actions fail.
+
+**Entry Point:** `ActHandler.act()` in `packages/core/lib/v3/handlers/actHandler.ts`
+
+### Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          ACT PIPELINE                                │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: act(instruction)
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Wait for Stability                                          │
+│ Location: actHandler.ts:75-78                                       │
+│                                                                      │
+│      ├──► Wait for DOM mutations to stop                            │
+│      └──► Wait for network requests to complete                     │
+│                                                                      │
+│ Ensures page is in stable state before capturing                    │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Capture Hybrid Snapshot                                     │
+│ Location: actHandler.ts:79-86                                       │
+│                                                                      │
+│ Same as Extract/Observe pipelines                                   │
+│      └──► Output: { combinedTree, combinedXpathMap }                │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: First LLM Call - Find Action Element                        │
+│ Location: actHandler.ts:88-102 → lib/inference.ts:358-481           │
+│                                                                      │
+│ Prompt Construction (lib/prompt.ts:143-205):                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ SYSTEM PROMPT                            │                        │
+│ │ buildActSystemPrompt()                   │                        │
+│ │                                           │                        │
+│ │ "You are helping the user automate the   │                        │
+│ │  browser by finding elements based on    │                        │
+│ │  what action the user wants to take on   │                        │
+│ │  the page.                                │                        │
+│ │                                           │                        │
+│ │  You will be given:                       │                        │
+│ │  1. a user defined instruction about     │                        │
+│ │     what action to take                   │                        │
+│ │  2. a hierarchical accessibility tree    │                        │
+│ │     showing the semantic structure of    │                        │
+│ │     the page.                             │                        │
+│ │                                           │                        │
+│ │  Return the element that matches the     │                        │
+│ │  instruction if it exists. Otherwise,    │                        │
+│ │  return an empty object."                 │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ USER PROMPT                              │                        │
+│ │ buildActPrompt()                         │                        │
+│ │                                           │                        │
+│ │ "Find the most relevant element to      │                        │
+│ │  perform an action on given the          │                        │
+│ │  following action: ${action}.            │                        │
+│ │                                           │                        │
+│ │  IF AND ONLY IF the action EXPLICITLY    │                        │
+│ │  includes the word 'dropdown' and        │                        │
+│ │  implies choosing/selecting an option    │                        │
+│ │  from a dropdown, ignore the 'General    │                        │
+│ │  Instructions' section, and follow the   │                        │
+│ │  'Dropdown Specific Instructions'        │                        │
+│ │  section carefully.                       │                        │
+│ │                                           │                        │
+│ │  General Instructions:                    │                        │
+│ │  - Provide an action for this element    │                        │
+│ │    such as ${supportedActions}           │                        │
+│ │  - Remember that to users, buttons and   │                        │
+│ │    links look the same                    │                        │
+│ │  - If action is unrelated, return empty  │                        │
+│ │    object                                 │                        │
+│ │  - ONLY return one action                 │                        │
+│ │  - For scroll positions: format as       │                        │
+│ │    percentage ('50%', '75%')             │                        │
+│ │  - For key press: use press method       │                        │
+│ │    ('Enter', 'Space', 'a')               │                        │
+│ │                                           │                        │
+│ │  Dropdown Specific Instructions:          │                        │
+│ │                                           │                        │
+│ │  CASE 1: element is a 'select' element   │                        │
+│ │    - use selectOptionFromDropdown        │                        │
+│ │    - set argument to exact option text   │                        │
+│ │    - set twoStep to false                 │                        │
+│ │                                           │                        │
+│ │  CASE 2: element is NOT a 'select':      │                        │
+│ │    - choose node that most closely       │                        │
+│ │      corresponds to instruction EVEN if  │                        │
+│ │      it's a 'StaticText' element         │                        │
+│ │    - choose 'click' method                │                        │
+│ │    - set twoStep to true                  │                        │
+│ │                                           │                        │
+│ │  [Variable substitution instructions if  │                        │
+│ │   variables provided]"                    │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ LLM Call:                                                            │
+│      │                                                               │
+│      ├──► Schema: {                                                 │
+│      │      elementId: z.string(),                                  │
+│      │      description: z.string(),                                │
+│      │      method: z.string(),                                     │
+│      │      arguments: z.array(z.string()),                         │
+│      │      twoStep: z.boolean()    // For non-select dropdowns     │
+│      │    }                                                          │
+│      │                                                               │
+│      └──► Output: Single element with action details                │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: Execute First Action (with Self-Heal)                       │
+│ Location: actHandler.ts:174-179, 375-478                            │
+│                                                                      │
+│ Map element ID to XPath → Execute action                            │
+│      │                                                               │
+│      ├──► Convert elementId to XPath using combinedXpathMap         │
+│      │                                                               │
+│      ├──► Call performUnderstudyMethod(method, xpath, args)         │
+│      │                                                               │
+│      ├──► IF ACTION SUCCEEDS:                                       │
+│      │      └──► Continue to Step 5 (check if twoStep)              │
+│      │                                                               │
+│      └──► IF ACTION FAILS & selfHeal=true:                          │
+│            ┌───────────────────────────────────┐                    │
+│            │ SELF-HEALING MECHANISM            │                    │
+│            │                                    │                    │
+│            │ 1. Log error and start reprocess  │                    │
+│            │                                    │                    │
+│            │ 2. Take FRESH snapshot            │                    │
+│            │    → New combinedTree & XpathMap  │                    │
+│            │                                    │                    │
+│            │ 3. Build instruction from         │                    │
+│            │    method + description            │                    │
+│            │    e.g., "click the Login button" │                    │
+│            │                                    │                    │
+│            │ 4. Call actInference() AGAIN      │                    │
+│            │    with fresh snapshot             │                    │
+│            │                                    │                    │
+│            │ 5. Extract new selector from      │                    │
+│            │    LLM response                    │                    │
+│            │                                    │                    │
+│            │ 6. RETRY                           │                    │
+│            │    performUnderstudyMethod()       │                    │
+│            │    with new selector               │                    │
+│            │                                    │                    │
+│            │ 7. Update metrics for healing     │                    │
+│            │    attempt                         │                    │
+│            └───────────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Two-Step Handling (if twoStep=true)                         │
+│ Location: actHandler.ts:182-301                                     │
+│                                                                      │
+│ Used for non-select dropdowns that need to be expanded first        │
+│                                                                      │
+│ ┌─────────────────────────────────────────────────────┐            │
+│ │ 5a. Capture Second Snapshot                         │            │
+│ │     After first action completes                     │            │
+│ │     → New combinedTree2 & XpathMap2                 │            │
+│ └─────────────────────────────────────────────────────┘            │
+│      │                                                               │
+│      ▼                                                               │
+│ ┌─────────────────────────────────────────────────────┐            │
+│ │ 5b. Diff Trees                                       │            │
+│ │     diffCombinedTrees(tree1, tree2)                 │            │
+│ │                                                       │            │
+│ │     → Finds newly appeared elements                  │            │
+│ │       (e.g., dropdown options that are now visible) │            │
+│ │     → If no diff found, uses full second tree       │            │
+│ └─────────────────────────────────────────────────────┘            │
+│      │                                                               │
+│      ▼                                                               │
+│ ┌─────────────────────────────────────────────────────┐            │
+│ │ 5c. Second LLM Call                                  │            │
+│ │                                                       │            │
+│ │     SYSTEM PROMPT: Same as first call                │            │
+│ │                                                       │            │
+│ │     USER PROMPT: buildStepTwoPrompt()                │            │
+│ │                                                       │            │
+│ │     "The original user action was:                   │            │
+│ │      ${originalUserAction}.                          │            │
+│ │                                                       │            │
+│ │      You have just taken the following action       │            │
+│ │      which completed step 1 of 2:                    │            │
+│ │      ${previousAction}.                              │            │
+│ │                                                       │            │
+│ │      Now, you must find the most relevant           │            │
+│ │      element to perform an action on in order       │            │
+│ │      to complete step 2 of 2.                        │            │
+│ │                                                       │            │
+│ │      [Same general instructions as buildActPrompt]" │            │
+│ │                                                       │            │
+│ │     Available actions: Excludes                      │            │
+│ │                        SELECT_OPTION_FROM_DROPDOWN   │            │
+│ │                        (already used in step 1)      │            │
+│ └─────────────────────────────────────────────────────┘            │
+│      │                                                               │
+│      ▼                                                               │
+│ ┌─────────────────────────────────────────────────────┐            │
+│ │ 5d. Execute Second Action                            │            │
+│ │     With new element from opened dropdown            │            │
+│ │     → Map to XPath → Execute action                  │            │
+│ └─────────────────────────────────────────────────────┘            │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ RETURN TO USER                                                       │
+│                                                                      │
+│ {                                                                    │
+│   success: true,                                                     │
+│   message: "Action completed successfully",                         │
+│   actionDescription: "clicked the Login button",                    │
+│   actions: [                                                         │
+│     {                                                                │
+│       description: "Login button",                                  │
+│       method: "click",                                               │
+│       arguments: [],                                                 │
+│       selector: "xpath=/html/body/div[1]/button"                   │
+│     },                                                               │
+│     // If two-step, second action here                              │
+│   ]                                                                  │
+│ }                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Two-Step Action Example
+
+**Scenario:** Select "Large" from a custom dropdown (not a `<select>` element)
+
+```
+User: act("select Large from the size dropdown")
+
+Step 1:
+  → LLM identifies dropdown trigger element
+  → Sets twoStep=true
+  → Clicks dropdown to expand it
+
+Step 2:
+  → Capture new snapshot (dropdown is now open)
+  → Diff trees to find newly visible options
+  → LLM identifies "Large" option in diff
+  → Clicks "Large" option
+  
+Result: Both actions recorded in actions array
+```
+
+### Self-Healing Example
+
+**Scenario:** Element moves or changes between snapshot and execution
+
+```
+Initial:
+  → Snapshot captured at time T0
+  → LLM identifies element at xpath1
+  → Page dynamically updates (animation, lazy load, etc.)
+  → Action FAILS at xpath1 (element not found/stale)
+
+Self-Heal (if enabled):
+  → Take FRESH snapshot at time T1
+  → LLM re-identifies element with new state
+  → New element at xpath2
+  → RETRY action at xpath2
+  → SUCCESS
+```
+
+### Data Transformations
+
+1. **Browser Page → Hybrid Snapshot**
+   - Waits for stability first
+   - DOM + A11y → Text tree + XPath map
+
+2. **Hybrid Tree + Instruction → Action**
+   - LLM identifies single most relevant element
+   - Returns method, arguments, and twoStep flag
+
+3. **EncodedId → XPath → Playwright Action**
+   - Maps to executable selector
+   - Performs Playwright command
+
+4. **(Two-Step) Tree Diff → New Elements**
+   - Captures changes after first action
+   - Identifies newly visible options
+
+5. **(Self-Heal) Error → Fresh Detection**
+   - Retries with updated page state
+   - New snapshot → New selector
+
+### Key Files
+
+- **Handler:** `packages/core/lib/v3/handlers/actHandler.ts`
+- **Prompts:** `packages/core/lib/prompt.ts` (lines 143-239)
+- **Inference:** `packages/core/lib/inference.ts` (lines 358-481)
+- **Tree Diff:** `packages/core/lib/v3/handlers/actHandler.ts` (diffCombinedTrees)
+
+### Usage Examples
+
+```typescript
+// Simple action
+await stagehand.act("click the Login button");
+
+// Action with typing
+await stagehand.act('type "john@example.com" into the email field');
+
+// Dropdown (two-step automatically detected)
+await stagehand.act("select Large from the size dropdown");
+
+// Key press
+await stagehand.act("press Enter");
+
+// Scroll
+await stagehand.act("scroll halfway down the page");
+
+// With self-healing enabled
+await stagehand.act("click the dynamic button", { selfHeal: true });
+```
+
