@@ -236,3 +236,165 @@ Accessibility Tree: \n${domElements}\n`,
 }
 ```
 
+---
+
+## Act Operation Prompts
+
+### 1. Act System Prompt (`buildActSystemPrompt`)
+
+**Purpose:** Instructs the AI to find the most relevant element to perform an action on. Unlike observe (which returns multiple elements), act returns a single element to interact with.
+
+**Location:** `packages/core/lib/prompt.ts:143-162`
+
+**Parameters:**
+- `userProvidedInstructions` (optional string): Custom instructions from the user
+
+**Key Features:**
+- Identifies single most relevant element for action
+- Works with hierarchical accessibility tree
+- Returns the element if found, otherwise returns empty object
+- Designed for action-oriented tasks (click, type, etc.)
+
+**Code:**
+```typescript
+export function buildActSystemPrompt(
+  userProvidedInstructions?: string,
+): ChatMessage {
+  const actSystemPrompt = `
+You are helping the user automate the browser by finding elements based on what action the user wants to take on the page
+
+You will be given:
+1. a user defined instruction about what action to take
+2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.
+
+Return the element that matches the instruction if it exists. Otherwise, return an empty object.`;
+  const content = actSystemPrompt.replace(/\s+/g, " ");
+
+  return {
+    role: "system",
+    content: [content, buildUserInstructionsString(userProvidedInstructions)]
+      .filter(Boolean)
+      .join("\n\n"),
+  };
+}
+```
+
+### 2. Act Prompt (`buildActPrompt`)
+
+**Purpose:** Provides detailed instructions for performing actions on elements, including complex dropdown handling, key presses, scrolling, and variable substitution.
+
+**Location:** `packages/core/lib/prompt.ts:164-205`
+
+**Parameters:**
+- `action` (string): The action to perform
+- `supportedActions` (string[]): List of available action methods
+- `variables` (optional Record<string, string>): Variables available for substitution
+
+**Key Features:**
+- **General Instructions:** Handles clicks, typing, scrolling, key presses
+- **Dropdown Handling (CASE 1):** For `<select>` elements - use selectOptionFromDropdown method
+- **Dropdown Handling (CASE 2):** For non-select dropdowns - click to expand first (two-step process)
+- **Scroll Position Formatting:** Converts user requests like "halfway" to "50%"
+- **Key Press Detection:** Identifies key press actions and formats them correctly
+- **Variable Substitution:** Supports using variables like `%username%` in actions
+
+**Code:**
+```typescript
+export function buildActPrompt(
+  action: string,
+  supportedActions: string[],
+  variables?: Record<string, string>,
+): string {
+  // Base instruction
+  let instruction = `Find the most relevant element to perform an action on given the following action: ${action}.
+  IF AND ONLY IF the action EXPLICITLY includes the word 'dropdown' and implies choosing/selecting an option from a dropdown, ignore the 'General Instructions' section, and follow the 'Dropdown Specific Instructions' section carefully.
+
+  General Instructions:
+    Provide an action for this element such as ${supportedActions.join(", ")}. Remember that to users, buttons and links look the same in most cases.
+    If the action is completely unrelated to a potential action to be taken on the page, return an empty object.
+    ONLY return one action. If multiple actions are relevant, return the most relevant one.
+    If the user is asking to scroll to a position on the page, e.g., 'halfway' or 0.75, etc, you must return the argument formatted as the correct percentage, e.g., '50%' or '75%', etc.
+    If the user is asking to scroll to the next chunk/previous chunk, choose the nextChunk/prevChunk method. No arguments are required here.
+    If the action implies a key press, e.g., 'press enter', 'press a', 'press space', etc., always choose the press method with the appropriate key as argument — e.g. 'a', 'Enter', 'Space'. Do not choose a click action on an on-screen keyboard. Capitalize the first character like 'Enter', 'Tab', 'Escape' only for special keys.
+
+  Dropdown Specific Instructions:
+    For interacting with dropdowns, there are two specific cases that you need to handle.
+
+    CASE 1: the element is a 'select' element.
+      - choose the selectOptionFromDropdown method,
+      - set the argument to the exact text of the option that should be selected,
+      - set twoStep to false.
+    CASE 2: the element is NOT a 'select' element:
+      - do not attempt to directly choose the element from the dropdown. You will need to click to expand the dropdown first. You will achieve this by following these instructions:
+        - choose the node that most closely corresponds to the given instruction EVEN if it is a 'StaticText' element, or otherwise does not appear to be interactable.
+        - choose the 'click' method
+        - set twoStep to true.
+  `;
+
+  // Add variable names (not values) to the instruction if any
+  if (variables && Object.keys(variables).length > 0) {
+    const variableNames = Object.keys(variables)
+      .map((key) => `%${key}%`)
+      .join(", ");
+    const variablesPrompt = `The following variables are available to use in the action: ${variableNames}. Fill the argument variables with the variable name.`;
+    instruction += ` ${variablesPrompt}`;
+  }
+
+  return instruction;
+}
+```
+
+### 3. Step Two Prompt (`buildStepTwoPrompt`)
+
+**Purpose:** Handles the second step of a two-step action sequence, particularly for dropdowns that need to be expanded first before selecting an option.
+
+**Location:** `packages/core/lib/prompt.ts:207-239`
+
+**Parameters:**
+- `originalUserAction` (string): The original action requested by the user
+- `previousAction` (string): The action that was just completed in step 1
+- `supportedActions` (string[]): List of available action methods
+- `variables` (optional Record<string, string>): Variables available for substitution
+
+**Key Features:**
+- References both the original action and what was just done in step 1
+- Provides guidance for completing the remaining part of the action
+- Includes all the same action-type handling as buildActPrompt (scroll, key press, etc.)
+
+**Code:**
+```typescript
+export function buildStepTwoPrompt(
+  originalUserAction: string,
+  previousAction: string,
+  supportedActions: string[],
+  variables?: Record<string, string>,
+): string {
+  // Base instruction
+  let instruction = `
+  The original user action was: ${originalUserAction}.
+  You have just taken the following action which completed step 1 of 2: ${previousAction}.
+
+  Now, you must find the most relevant element to perform an action on in order to complete step 2 of 2.
+
+  General Instructions:
+  Provide an action for this element such as ${supportedActions.join(", ")}. Remember that to users, buttons and links look the same in most cases.
+  If the action is completely unrelated to a potential action to be taken on the page, return an empty object.
+  ONLY return one action. If multiple actions are relevant, return the most relevant one.
+  If the user is asking to scroll to a position on the page, e.g., 'halfway' or 0.75, etc, you must return the argument formatted as the correct percentage, e.g., '50%' or '75%', etc.
+  If the user is asking to scroll to the next chunk/previous chunk, choose the nextChunk/prevChunk method. No arguments are required here.
+  If the action implies a key press, e.g., 'press enter', 'press a', 'press space', etc., always choose the press method with the appropriate key as argument — e.g. 'a', 'Enter', 'Space'. Do not choose a click action on an on-screen keyboard. Capitalize the first character like 'Enter', 'Tab', 'Escape' only for special keys.
+  `;
+
+  // Add variable names (not values) to the instruction if any
+  if (variables && Object.keys(variables).length > 0) {
+    const variableNames = Object.keys(variables)
+      .map((key) => `%${key}%`)
+      .join(", ");
+    const variablesPrompt = `The following variables are available to use in the action: ${variableNames}. Fill the argument variables with the variable name.`;
+    instruction += ` ${variablesPrompt}`;
+  }
+
+  return instruction;
+}
+```
+
