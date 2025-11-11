@@ -1177,3 +1177,383 @@ console.log(result.completed);  // true if task completed
 console.log(result.actions);    // All actions taken
 ```
 
+
+---
+
+## Computer Use Agent Pipelines
+
+Computer Use Agents (CUA) use provider-specific APIs (Anthropic, OpenAI, Google) that support direct browser control. Unlike V3 Agent which uses abstracted tools, CUA agents use provider-native computer use capabilities.
+
+### Anthropic CUA Pipeline
+
+**Entry Point:** `AnthropicCUAClient.execute()` in `packages/core/lib/v3/agent/AnthropicCUAClient.ts`
+
+#### Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     ANTHROPIC CUA PIPELINE                           │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: cua.execute(instruction)
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Initialize Messages                                         │
+│                                                                      │
+│ messages = [                                                         │
+│   {                                                                  │
+│     role: "user",                                                    │
+│     content: userProvidedInstructions || buildCuaDefaultSystemPrompt│
+│   },                                                                 │
+│   {                                                                  │
+│     role: "user",                                                    │
+│     content: instruction                                             │
+│   }                                                                  │
+│ ]                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Execute Steps Loop (max 10 by default)                      │
+│                                                                      │
+│ ┌───────────────────────────────────────────────────────┐          │
+│ │ Loop Iteration:                                        │          │
+│ │                                                        │          │
+│ │ ┌─────────────────────────────────────────────────┐  │          │
+│ │ │ 2a. Call Anthropic Messages API                 │  │          │
+│ │ │                                                  │  │          │
+│ │ │ Parameters:                                      │  │          │
+│ │ │   model: user-specified model                   │  │          │
+│ │ │   max_tokens: 4096                               │  │          │
+│ │ │   messages: conversation history                 │  │          │
+│ │ │   betas: ["computer-use-2025-01-24"]            │  │          │
+│ │ │   tools: [                                       │  │          │
+│ │ │     {                                            │  │          │
+│ │ │       type: "computer_20250124",                │  │          │
+│ │ │       name: "computer",                          │  │          │
+│ │ │       display_width_px: viewport.width,         │  │          │
+│ │ │       display_height_px: viewport.height        │  │          │
+│ │ │     },                                           │  │          │
+│ │ │     ...mcpTools  // Custom MCP tools if any     │  │          │
+│ │ │   ]                                              │  │          │
+│ │ │   thinking: {                                    │  │          │
+│ │ │     type: "enabled",                             │  │          │
+│ │ │     budget_tokens: thinkingBudget  // if set    │  │          │
+│ │ │   }                                              │  │          │
+│ │ └─────────────────────────────────────────────────┘  │          │
+│ │      │                                                 │          │
+│ │      ▼                                                 │          │
+│ │ ┌─────────────────────────────────────────────────┐  │          │
+│ │ │ 2b. Process Response                             │  │          │
+│ │ │                                                  │  │          │
+│ │ │ Extract from content blocks:                     │  │          │
+│ │ │   - tool_use blocks → Actions to execute        │  │          │
+│ │ │   - text blocks → Reasoning/thinking            │  │          │
+│ │ │   - thinking blocks → Extended thinking         │  │          │
+│ │ │                                                  │  │          │
+│ │ │ For each tool_use block:                         │  │          │
+│ │ │   IF tool is "computer":                         │  │          │
+│ │ │     → Extract action & parameters                │  │          │
+│ │ │     → Convert Anthropic format to Stagehand     │  │          │
+│ │ │                                                  │  │          │
+│ │ │   Action Conversions:                            │  │          │
+│ │ │     "left_click" [x, y] →                       │  │          │
+│ │ │       click(x_scaled, y_scaled)                  │  │          │
+│ │ │                                                  │  │          │
+│ │ │     "type" text →                                │  │          │
+│ │ │       type(text)                                 │  │          │
+│ │ │                                                  │  │          │
+│ │ │     "key" keyName →                              │  │          │
+│ │ │       keypress([keyName])                        │  │          │
+│ │ │                                                  │  │          │
+│ │ │     "scroll" direction distance →                │  │          │
+│ │ │       scroll_y: distance pixels                  │  │          │
+│ │ │                                                  │  │          │
+│ │ │     "cursor_position" [x, y] →                  │  │          │
+│ │ │       hover(x_scaled, y_scaled)                  │  │          │
+│ │ │                                                  │  │          │
+│ │ │     "screenshot" →                               │  │          │
+│ │ │       screenshot()                               │  │          │
+│ │ │                                                  │  │          │
+│ │ │   Coordinate Scaling:                            │  │          │
+│ │ │     Anthropic uses 0-1000 range                  │  │          │
+│ │ │     x_actual = (x / 1000) * viewport.width      │  │          │
+│ │ │     y_actual = (y / 1000) * viewport.height     │  │          │
+│ │ └─────────────────────────────────────────────────┘  │          │
+│ │      │                                                 │          │
+│ │      ▼                                                 │          │
+│ │ ┌─────────────────────────────────────────────────┐  │          │
+│ │ │ 2c. Execute Actions                              │  │          │
+│ │ │                                                  │  │          │
+│ │ │ For each converted action:                       │  │          │
+│ │ │   → Call actionHandler(action)                   │  │          │
+│ │ │   → Performs Playwright command                  │  │          │
+│ │ │   → Records action in history                    │  │          │
+│ │ └─────────────────────────────────────────────────┘  │          │
+│ │      │                                                 │          │
+│ │      ▼                                                 │          │
+│ │ ┌─────────────────────────────────────────────────┐  │          │
+│ │ │ 2d. Generate Tool Results                        │  │          │
+│ │ │                                                  │  │          │
+│ │ │ For each tool_use:                               │  │          │
+│ │ │                                                  │  │          │
+│ │ │   IF "computer" tool:                            │  │          │
+│ │ │     → Take screenshot                            │  │          │
+│ │ │     → Create tool_result:                        │  │          │
+│ │ │       {                                          │  │          │
+│ │ │         type: "tool_result",                     │  │          │
+│ │ │         tool_use_id: toolUseId,                  │  │          │
+│ │ │         content: [                               │  │          │
+│ │ │           {                                      │  │          │
+│ │ │             type: "image",                       │  │          │
+│ │ │             source: {                            │  │          │
+│ │ │               type: "base64",                    │  │          │
+│ │ │               media_type: "image/png",          │  │          │
+│ │ │               data: base64Screenshot            │  │          │
+│ │ │             }                                    │  │          │
+│ │ │           },                                     │  │          │
+│ │ │           {                                      │  │          │
+│ │ │             type: "text",                        │  │          │
+│ │ │             text: "Current URL: https://..."    │  │          │
+│ │ │           }                                      │  │          │
+│ │ │         ]                                        │  │          │
+│ │ │       }                                          │  │          │
+│ │ │                                                  │  │          │
+│ │ │   IF custom MCP tool:                            │  │          │
+│ │ │     → Execute tool via MCP                       │  │          │
+│ │ │     → Return result as tool_result               │  │          │
+│ │ └─────────────────────────────────────────────────┘  │          │
+│ │      │                                                 │          │
+│ │      ▼                                                 │          │
+│ │ ┌─────────────────────────────────────────────────┐  │          │
+│ │ │ 2e. Add to Conversation                          │  │          │
+│ │ │                                                  │  │          │
+│ │ │ messages.push({                                  │  │          │
+│ │ │   role: "assistant",                             │  │          │
+│ │ │   content: [                                     │  │          │
+│ │ │     ...thinkingBlocks,                           │  │          │
+│ │ │     ...textBlocks,                               │  │          │
+│ │ │     ...toolUseBlocks                             │  │          │
+│ │ │   ]                                              │  │          │
+│ │ │ });                                              │  │          │
+│ │ │                                                  │  │          │
+│ │ │ messages.push({                                  │  │          │
+│ │ │   role: "user",                                  │  │          │
+│ │ │   content: toolResults                           │  │          │
+│ │ │ });                                              │  │          │
+│ │ │                                                  │  │          │
+│ │ │ Compress conversation images periodically        │  │          │
+│ │ │ (keep only recent screenshots)                   │  │          │
+│ │ └─────────────────────────────────────────────────┘  │          │
+│ │      │                                                 │          │
+│ │      ▼                                                 │          │
+│ │ ┌─────────────────────────────────────────────────┐  │          │
+│ │ │ 2f. Check Completion                             │  │          │
+│ │ │                                                  │  │          │
+│ │ │ IF no tool_use blocks in response:               │  │          │
+│ │ │   → Task completed                               │  │          │
+│ │ │   → Exit loop                                    │  │          │
+│ │ │                                                  │  │          │
+│ │ │ ELSE IF maxSteps reached:                        │  │          │
+│ │ │   → Exit loop                                    │  │          │
+│ │ │                                                  │  │          │
+│ │ │ ELSE:                                            │  │          │
+│ │ │   → Continue to next iteration                   │  │          │
+│ │ └─────────────────────────────────────────────────┘  │          │
+│ └───────────────────────────────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ RETURN TO USER                                                       │
+│                                                                      │
+│ {                                                                    │
+│   completed: boolean,       // No tool_use in last response         │
+│   message: string,           // Last text response                   │
+│   actions: Action[],         // All actions executed                 │
+│   usage: TokenUsage          // Total tokens used                    │
+│ }                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Features
+
+1. **Native Computer Control**
+   - Uses Anthropic's computer_20250124 tool
+   - Direct coordinate-based interaction
+   - Screenshot feedback after each action
+
+2. **Coordinate System**
+   - Anthropic uses 0-1000 normalized coordinates
+   - Scaled to actual viewport dimensions
+   - More flexible than selector-based approaches
+
+3. **Extended Thinking**
+   - Optional thinking budget for reasoning
+   - Separate thinking blocks in response
+   - Can use Claude 3.5 Sonnet thinking mode
+
+4. **Image Compression**
+   - Keeps only recent screenshots in conversation
+   - Prevents context window overflow
+   - Maintains enough history for decision-making
+
+---
+
+### OpenAI CUA Pipeline
+
+**Entry Point:** `OpenAICUAClient.execute()` in `packages/core/lib/v3/agent/OpenAICUAClient.ts`
+
+#### Flow Diagram (Differences from Anthropic)
+
+```
+Key Differences from Anthropic CUA:
+
+1. API Format:
+   - Uses Responses API (not Messages API)
+   - Input items instead of messages
+   - previous_response_id for continuity
+
+2. Request Structure:
+   {
+     model: modelName,
+     tools: [{
+       type: "computer_use_preview",
+       display_width: width,
+       display_height: height,
+       environment: "browser"  // or "mac", "windows", "ubuntu"
+     }],
+     input: inputItems,
+     previous_response_id: previousId
+   }
+
+3. Response Processing:
+   - Extract computer_call items (not tool_use)
+   - Extract function_call items (custom tools)
+   - Extract reasoning items (o1-style thinking)
+   - Extract message items (text responses)
+
+4. Tool Result Format:
+   - computer_call_output (not tool_result)
+   - function_call_output (for custom tools)
+
+5. Conversation Tracking:
+   - Uses previous_response_id
+   - No separate user/assistant roles in input
+   - All outputs appended for next request
+
+Action conversions similar to Anthropic CUA
+```
+
+---
+
+### Google CUA Pipeline
+
+**Entry Point:** `GoogleCUAClient.execute()` in `packages/core/lib/v3/agent/GoogleCUAClient.ts`
+
+#### Flow Diagram (Differences from Others)
+
+```
+Key Differences from Anthropic/OpenAI CUA:
+
+1. Tool Definition:
+   {
+     computerUse: {
+       environment: "ENVIRONMENT_BROWSER"
+     },
+     functionDeclarations: customTools  // MCP tools if any
+   }
+
+2. History Format:
+   - Uses parts array for content
+   - User/model roles (not assistant)
+   - Compressed images (keeps only last 2)
+
+3. Action Conversions:
+   Function Name → Stagehand Action
+   
+   "click_at" [x, y] →
+     click(x_actual, y_actual)
+   
+   "type_text_at" [x, y, text, opts] →
+     1. click(x, y)
+     2. IF clear_before_typing: select_all + backspace
+     3. type(text)
+     4. IF press_enter: keypress(["Enter"])
+   
+   "key_combination" keys →
+     keypress(mappedKeys)
+     Key mapping: "ctrl" → "Control", etc.
+   
+   "scroll_document" direction →
+     direction == "down": keypress(["PageDown"])
+     direction == "up": keypress(["PageUp"])
+   
+   "scroll_at" [x, y, magnitude] →
+     scroll_y: magnitude pixels
+   
+   "navigate" url →
+     goto(url)
+   
+   "go_back" / "go_forward" →
+     navback() / navforward()
+   
+   "wait_5_seconds" →
+     wait(5000)
+   
+   "drag_and_drop" [x1, y1, x2, y2] →
+     drag with path
+
+4. Coordinate Normalization:
+   - Google uses 0-1000 range (like Anthropic)
+   - Must cap coordinates at 999 to avoid errors
+   - Special sanitization in history
+
+5. Retry Logic:
+   - Up to 5 attempts with exponential backoff
+   - Handles rate limiting gracefully
+   - 2s, 4s, 8s, 16s, 32s delays
+
+6. Special Handling:
+   - "open_web_browser": No-op (already in browser)
+   - "type_text_at": Multi-step automation
+   - Adds delays between actions (100ms)
+
+7. Function Response Format:
+   {
+     name: functionCall.name,
+     response: { url: currentUrl },
+     parts: [{
+       inlineData: {
+         mimeType: "image/png",
+         data: base64Screenshot
+       }
+     }]
+   }
+```
+
+---
+
+## CUA Comparison
+
+| Feature | Anthropic | OpenAI | Google |
+|---------|-----------|--------|--------|
+| **API Type** | Messages API | Responses API | Generative AI API |
+| **Tool Name** | computer_20250124 | computer_use_preview | computerUse |
+| **Coordinates** | 0-1000 | 0-1000 | 0-1000 |
+| **Environment** | N/A | Configurable | ENVIRONMENT_BROWSER |
+| **Thinking** | thinking blocks | reasoning items | N/A (in model) |
+| **Continuity** | Conversation | previous_response_id | History |
+| **Image Compression** | Yes | Yes | Yes (last 2 only) |
+| **Retry Logic** | No | No | Yes (5 attempts) |
+| **Action Delays** | No | No | Yes (100ms) |
+| **Type Text** | Simple | Simple | Multi-step (click+type+enter) |
+| **Key Mapping** | Direct | Direct | Custom mapping |
+
+### When to Use Each CUA
+
+- **Anthropic CUA**: Best for extended thinking, complex reasoning tasks
+- **OpenAI CUA**: Good for tasks needing o1-style reasoning, diverse environments
+- **Google CUA**: Best for cost-effective automation, built-in retry logic
+
