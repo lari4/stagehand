@@ -262,3 +262,198 @@ const result = await stagehand.extract(
 // Result: { products: [{ name: "...", price: 29.99 }, ...] }
 ```
 
+
+---
+
+## Observe Pipeline
+
+**Purpose:** Find multiple elements on a page based on observation intent without performing actions on them.
+
+**Entry Point:** `ObserveHandler.observe()` in `packages/core/lib/v3/handlers/observeHandler.ts`
+
+### Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        OBSERVE PIPELINE                              │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: observe(instruction)
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Capture Hybrid Snapshot                                     │
+│ Location: observeHandler.ts:81-84                                   │
+│                                                                      │
+│ Same process as Extract Pipeline:                                   │
+│      │                                                               │
+│      ├──► Enable CDP Domains (DOM, Accessibility)                   │
+│      ├──► Build DOM Tree + Accessibility Tree                       │
+│      ├──► Merge Trees into Hybrid Snapshot                          │
+│      │                                                               │
+│      └──► Output: {                                                 │
+│              combinedTree: string,         // Human-readable tree   │
+│              combinedXpathMap: Map         // ID → XPath            │
+│           }                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: LLM Call - Find Elements                                    │
+│ Location: observeHandler.ts:96-103 → lib/inference.ts:223-356       │
+│                                                                      │
+│ Prompt Construction (lib/prompt.ts:111-141):                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ SYSTEM PROMPT                            │                        │
+│ │ buildObserveSystemPrompt()               │                        │
+│ │                                           │                        │
+│ │ "You are helping the user automate the   │                        │
+│ │  browser by finding elements based on    │                        │
+│ │  what the user wants to observe in the   │                        │
+│ │  page.                                    │                        │
+│ │                                           │                        │
+│ │  You will be given:                       │                        │
+│ │  1. a instruction of elements to         │                        │
+│ │     observe                               │                        │
+│ │  2. a hierarchical accessibility tree    │                        │
+│ │     showing the semantic structure of    │                        │
+│ │     the page. The tree is a hybrid of    │                        │
+│ │     the DOM and the accessibility tree.  │                        │
+│ │                                           │                        │
+│ │  Return an array of elements that match  │                        │
+│ │  the instruction if they exist,          │                        │
+│ │  otherwise return an empty array."       │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ USER PROMPT                              │                        │
+│ │ buildObserveUserMessage()                │                        │
+│ │                                           │                        │
+│ │ "instruction: ${instruction}             │                        │
+│ │  Accessibility Tree: \n${domElements}"  │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ LLM Call: llmClient.createChatCompletion()                          │
+│      │                                                               │
+│      ├──► Temperature: 0.1 (deterministic)                          │
+│      ├──► Response Format: Structured output (observe schema)       │
+│      │                                                               │
+│      │    Schema: {                                                 │
+│      │      elements: z.array(z.object({                            │
+│      │        elementId: z.string(),      // "ordinal-nodeId"       │
+│      │        description: z.string(),                              │
+│      │        method: z.string(),         // Playwright method      │
+│      │        arguments: z.array(z.string())                        │
+│      │      }))                                                      │
+│      │    }                                                          │
+│      │                                                               │
+│      └──► Output: Array of element objects with IDs                 │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Map Element IDs to Selectors                                │
+│ Location: observeHandler.ts:120-149                                 │
+│                                                                      │
+│ For each element in LLM response:                                   │
+│      │                                                               │
+│      ├──► Take elementId (format: "ordinal-backendNodeId")          │
+│      │                                                               │
+│      ├──► Look up in combinedXpathMap[elementId]                    │
+│      │    → combinedXpathMap["0-42"] = "/html/body/div[1]/button"  │
+│      │                                                               │
+│      ├──► Trim trailing text nodes from XPath                       │
+│      │    (Remove ::text()[1] suffixes for cleaner selectors)       │
+│      │                                                               │
+│      ├──► Format as Action object:                                  │
+│      │    {                                                          │
+│      │      description: "Login button",                            │
+│      │      method: "click",                                         │
+│      │      arguments: [],                                           │
+│      │      selector: "xpath=/html/body/div[1]/button"             │
+│      │    }                                                          │
+│      │                                                               │
+│      └──► Add to results array                                      │
+│                                                                      │
+│ Output: Array of Action objects ready for execution                 │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ RETURN TO USER                                                       │
+│                                                                      │
+│ {                                                                    │
+│   elements: [                                                        │
+│     {                                                                │
+│       description: "Login button",                                  │
+│       method: "click",                                               │
+│       arguments: [],                                                 │
+│       selector: "xpath=/html/body/div[1]/button"                   │
+│     },                                                               │
+│     {                                                                │
+│       description: "Username input",                                │
+│       method: "fill",                                                │
+│       arguments: [],                                                 │
+│       selector: "xpath=/html/body/div[1]/input[1]"                 │
+│     },                                                               │
+│     ...                                                              │
+│   ]                                                                  │
+│ }                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Transformations
+
+1. **Browser Page → Hybrid Snapshot**
+   - DOM tree + Accessibility tree → Merged text representation
+   - XPath mapping for element location
+
+2. **Hybrid Tree + Instruction → Element Array**
+   - LLM identifies all matching elements from tree
+   - Returns array with element IDs and descriptions
+
+3. **EncodedId → XPath**
+   - Maps element IDs to XPath selectors
+   - Format: `"ordinal-backendNodeId"` → `"/html/body/..."`
+
+4. **XPath → Action Objects**
+   - Formats as executable action objects
+   - Adds `xpath=` prefix for Playwright
+   - Includes method and arguments
+
+### Key Differences from Extract
+
+- **Multiple Results:** Returns array of elements vs single extraction
+- **No Schema Required:** Just an instruction, no structured schema
+- **Selector Generation:** Focuses on generating Playwright selectors
+- **No Metadata Call:** Single LLM call (no completion evaluation)
+
+### Key Files
+
+- **Handler:** `packages/core/lib/v3/handlers/observeHandler.ts`
+- **Prompts:** `packages/core/lib/prompt.ts` (lines 111-141)
+- **Inference:** `packages/core/lib/inference.ts` (lines 223-356)
+
+### Usage Example
+
+```typescript
+const result = await stagehand.observe("find all buttons on the page");
+
+// Result: {
+//   elements: [
+//     { 
+//       description: "Submit button", 
+//       method: "click", 
+//       selector: "xpath=..." 
+//     },
+//     { 
+//       description: "Cancel button", 
+//       method: "click", 
+//       selector: "xpath=..." 
+//     },
+//     ...
+//   ]
+// }
+```
+
