@@ -1557,3 +1557,493 @@ Key Differences from Anthropic/OpenAI CUA:
 - **OpenAI CUA**: Good for tasks needing o1-style reasoning, diverse environments
 - **Google CUA**: Best for cost-effective automation, built-in retry logic
 
+
+---
+
+## Evaluator Pipeline
+
+**Purpose:** Evaluate whether a task goal was achieved based on screenshots, agent reasoning, or both. Returns YES/NO evaluation with detailed reasoning.
+
+**Entry Point:** `V3Evaluator.ask()`, `batchAsk()`, or `_evaluateWithMultipleScreenshots()` in `packages/core/lib/v3Evaluator.ts`
+
+### Flow Diagram - Single Evaluation
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    EVALUATOR PIPELINE (SINGLE)                       │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: evaluator.ask({ question, screenshot: true })
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Wait and Capture Screenshot                                 │
+│ Location: v3Evaluator.ts:87-92                                      │
+│                                                                      │
+│      ├──► Wait screenshotDelayMs (default: 250ms)                   │
+│      │    → Ensures page rendering is complete                      │
+│      │                                                               │
+│      └──► IF screenshot enabled:                                    │
+│             → page.screenshot({ fullPage: false })                   │
+│             → Capture as PNG buffer                                 │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Build Evaluation Prompt                                     │
+│ Location: v3Evaluator.ts:85, 98-130                                 │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ SYSTEM PROMPT                            │                        │
+│ │                                           │                        │
+│ │ "You are an expert evaluator that        │                        │
+│ │  confidently returns YES or NO based on  │                        │
+│ │  if the original goal was achieved.      │                        │
+│ │                                           │                        │
+│ │  You have access to                      │                        │
+│ │  [a screenshot / the agents reasoning    │                        │
+│ │   and actions throughout the task]       │                        │
+│ │  that you can use to evaluate the tasks  │                        │
+│ │  completion.                              │                        │
+│ │                                           │                        │
+│ │  Provide detailed reasoning for your     │                        │
+│ │  answer.                                  │                        │
+│ │                                           │                        │
+│ │  Today's date is ${currentDate}"         │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ USER MESSAGE                             │                        │
+│ │                                           │                        │
+│ │ Content Parts:                            │                        │
+│ │                                           │                        │
+│ │ 1. Text Part:                             │                        │
+│ │    IF agentReasoning:                     │                        │
+│ │      "Question: ${question}              │                        │
+│ │                                           │                        │
+│ │       Agent's reasoning and actions      │                        │
+│ │       taken:                              │                        │
+│ │       ${agentReasoning}"                  │                        │
+│ │    ELSE:                                  │                        │
+│ │      "${question}"                        │                        │
+│ │                                           │                        │
+│ │ 2. Image Part (if screenshot):            │                        │
+│ │    {                                      │                        │
+│ │      type: "image_url",                   │                        │
+│ │      image_url: {                         │                        │
+│ │        url: "data:image/jpeg;base64,..." │                        │
+│ │      }                                    │                        │
+│ │    }                                      │                        │
+│ │                                           │                        │
+│ │ 3. Answer Part (if provided):             │                        │
+│ │    {                                      │                        │
+│ │      type: "text",                        │                        │
+│ │      text: "the answer is ${answer}"     │                        │
+│ │    }                                      │                        │
+│ └──────────────────────────────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: LLM Call                                                     │
+│ Location: v3Evaluator.ts:96-130                                     │
+│                                                                      │
+│ llmClient.createChatCompletion({                                     │
+│   logger: silentLogger,                                              │
+│   options: {                                                         │
+│     messages: [systemPrompt, userMessage],                           │
+│     response_model: {                                                │
+│       name: "EvaluationResult",                                      │
+│       schema: EvaluationSchema                                       │
+│     }                                                                 │
+│   }                                                                  │
+│ })                                                                   │
+│                                                                      │
+│ EvaluationSchema = z.object({                                        │
+│   evaluation: z.enum(["YES", "NO"]),                                │
+│   reasoning: z.string()                                              │
+│ })                                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ RETURN TO USER                                                       │
+│                                                                      │
+│ {                                                                    │
+│   evaluation: "YES" | "NO" | "INVALID",                             │
+│   reasoning: "Detailed explanation of why..."                       │
+│ }                                                                    │
+│                                                                      │
+│ Note: "INVALID" returned if parsing fails                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Flow Diagram - Batch Evaluation
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   EVALUATOR PIPELINE (BATCH)                         │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: evaluator.batchAsk({
+  questions: [
+    { question: "Is user logged in?", answer: "john@example.com" },
+    { question: "Is cart showing items?" },
+    ...
+  ],
+  screenshot: true
+})
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Capture Single Screenshot                                   │
+│                                                                      │
+│ One screenshot for all questions                                     │
+│      └──► page.screenshot({ fullPage: false })                      │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Format Questions                                            │
+│ Location: v3Evaluator.ts:168-173                                    │
+│                                                                      │
+│ Formatted Text:                                                      │
+│ "1. Is user logged in?                                              │
+│     Answer: john@example.com                                         │
+│                                                                      │
+│  2. Is cart showing items?                                           │
+│                                                                      │
+│  3. Is checkout button visible?                                      │
+│     Answer: Yes"                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Build Batch Prompt                                          │
+│ Location: v3Evaluator.ts:180-183                                    │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ SYSTEM PROMPT                            │                        │
+│ │                                           │                        │
+│ │ "${baseSystemPrompt}                     │                        │
+│ │                                           │                        │
+│ │  You will be given multiple questions    │                        │
+│ │  [with a screenshot].                     │                        │
+│ │  [Some questions include answers to      │                        │
+│ │   evaluate.]                              │                        │
+│ │                                           │                        │
+│ │  Answer each question by returning an    │                        │
+│ │  object in the specified JSON format.    │                        │
+│ │  Return a single JSON array containing   │                        │
+│ │  one object for each question in the     │                        │
+│ │  order they were asked."                  │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ USER MESSAGE                             │                        │
+│ │                                           │                        │
+│ │ Content:                                  │                        │
+│ │   [formatted questions text]              │                        │
+│ │   [screenshot if enabled]                 │                        │
+│ └──────────────────────────────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: LLM Call with Batch Schema                                  │
+│ Location: v3Evaluator.ts:175-207                                    │
+│                                                                      │
+│ BatchEvaluationSchema = z.array(EvaluationSchema)                   │
+│                                                                      │
+│ Returns array of evaluations, one per question                      │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ RETURN TO USER                                                       │
+│                                                                      │
+│ [                                                                    │
+│   {                                                                  │
+│     evaluation: "YES",                                               │
+│     reasoning: "User email john@example.com is visible..."          │
+│   },                                                                 │
+│   {                                                                  │
+│     evaluation: "NO",                                                │
+│     reasoning: "Cart appears empty in the screenshot..."            │
+│   },                                                                 │
+│   ...                                                                │
+│ ]                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Flow Diagram - Multi-Screenshot Evaluation
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              EVALUATOR PIPELINE (MULTI-SCREENSHOT)                   │
+└─────────────────────────────────────────────────────────────────────┘
+
+User Request: evaluator.ask({
+  question: "Did the user successfully add item to cart?",
+  screenshot: [screenshot1, screenshot2, screenshot3],
+  agentReasoning: "Step 1: Clicked product... Step 2: ..."
+})
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Build Multi-Screenshot Prompt                               │
+│ Location: v3Evaluator.ts:227-243                                    │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ SYSTEM PROMPT                            │                        │
+│ │                                           │                        │
+│ │ "You are an expert evaluator that        │                        │
+│ │  confidently returns YES or NO given a   │                        │
+│ │  question and multiple screenshots       │                        │
+│ │  showing the progression of a task.      │                        │
+│ │                                           │                        │
+│ │  [You also have access to the agent's    │                        │
+│ │   detailed reasoning and thought process │                        │
+│ │   throughout the task.]                   │                        │
+│ │                                           │                        │
+│ │  Analyze ALL screenshots to understand   │                        │
+│ │  the complete journey. Look for evidence │                        │
+│ │  of task completion across all           │                        │
+│ │  screenshots, not just the last one.     │                        │
+│ │                                           │                        │
+│ │  Success criteria may appear at          │                        │
+│ │  different points in the sequence        │                        │
+│ │  (confirmation messages, intermediate    │                        │
+│ │   states, etc).                           │                        │
+│ │                                           │                        │
+│ │  [The agent's reasoning provides crucial │                        │
+│ │   context about what actions were        │                        │
+│ │   attempted, what was observed, and the  │                        │
+│ │   decision-making process. Use this      │                        │
+│ │   alongside the visual evidence to make  │                        │
+│ │   a comprehensive evaluation.]           │                        │
+│ │                                           │                        │
+│ │  Today's date is ${currentDate}"         │                        │
+│ └──────────────────────────────────────────┘                        │
+│                                                                      │
+│ ┌──────────────────────────────────────────┐                        │
+│ │ USER MESSAGE                             │                        │
+│ │                                           │                        │
+│ │ IF agentReasoning:                        │                        │
+│ │   "Question: ${question}                 │                        │
+│ │                                           │                        │
+│ │    Agent's reasoning and actions         │                        │
+│ │    throughout the task:                   │                        │
+│ │    ${agentReasoning}                      │                        │
+│ │                                           │                        │
+│ │    I'm providing ${screenshots.length}   │                        │
+│ │    screenshots showing the progression   │                        │
+│ │    of the task. Please analyze both the  │                        │
+│ │    agent's reasoning and all screenshots │                        │
+│ │    to determine if the task was          │                        │
+│ │    completed successfully."               │                        │
+│ │                                           │                        │
+│ │ ELSE:                                     │                        │
+│ │   "${question}                            │                        │
+│ │                                           │                        │
+│ │    I'm providing ${screenshots.length}   │                        │
+│ │    screenshots showing the progression   │                        │
+│ │    of the task. Please analyze all of    │                        │
+│ │    them to determine if the task was     │                        │
+│ │    completed successfully."               │                        │
+│ │                                           │                        │
+│ │ Content Parts:                            │                        │
+│ │   [text part above]                       │                        │
+│ │   [image 1: base64 PNG]                   │                        │
+│ │   [image 2: base64 PNG]                   │                        │
+│ │   [image 3: base64 PNG]                   │                        │
+│ │   ...                                     │                        │
+│ └──────────────────────────────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: LLM Call                                                     │
+│ Location: v3Evaluator.ts:261-283                                    │
+│                                                                      │
+│ Same schema as single evaluation                                    │
+│ LLM analyzes all images together                                    │
+└─────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ RETURN TO USER                                                       │
+│                                                                      │
+│ {                                                                    │
+│   evaluation: "YES",                                                 │
+│   reasoning: "Looking across all 3 screenshots, I can see the       │
+│              progression: Screenshot 1 shows the product page,      │
+│              Screenshot 2 shows the 'Add to Cart' button being      │
+│              clicked with a loading state, and Screenshot 3 shows   │
+│              the cart icon updated with '1 item' and a confirmation │
+│              message. The agent's reasoning confirms these steps.   │
+│              Task completed successfully."                           │
+│ }                                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Use Cases
+
+#### Single Evaluation
+```typescript
+// Evaluate based on screenshot only
+const result = await evaluator.ask({
+  question: "Is the user logged in?",
+  screenshot: true
+});
+
+// Evaluate based on agent reasoning only
+const result = await evaluator.ask({
+  question: "Did the agent complete the checkout?",
+  screenshot: false,
+  agentReasoning: agent.collectedReasoning
+});
+
+// Evaluate with both screenshot and reasoning
+const result = await evaluator.ask({
+  question: "Was the form submitted successfully?",
+  screenshot: true,
+  agentReasoning: agent.collectedReasoning
+});
+```
+
+#### Batch Evaluation
+```typescript
+// Evaluate multiple assertions at once
+const results = await evaluator.batchAsk({
+  questions: [
+    { question: "Is user logged in?" },
+    { question: "Is cart showing 3 items?" },
+    { question: "Is total price correct?", answer: "$149.99" }
+  ],
+  screenshot: true
+});
+
+// Results: Array of YES/NO evaluations
+```
+
+#### Multi-Screenshot Evaluation
+```typescript
+// Capture screenshots during agent execution
+const screenshots = [];
+agent.onStep((step) => {
+  screenshots.push(step.screenshot);
+});
+
+// Evaluate based on entire journey
+const result = await evaluator.ask({
+  question: "Did the user successfully complete the purchase?",
+  screenshot: screenshots,
+  agentReasoning: agent.collectedReasoning
+});
+```
+
+### Key Features
+
+1. **Flexible Input**
+   - Screenshot only
+   - Agent reasoning only
+   - Both screenshot and reasoning
+   - Multiple screenshots for progression analysis
+
+2. **Structured Output**
+   - Always returns YES/NO/INVALID
+   - Detailed reasoning for decision
+   - INVALID only on parsing errors
+
+3. **Batch Processing**
+   - Multiple questions with one screenshot
+   - Efficient for assertion testing
+   - Maintains question order
+
+4. **Journey Analysis**
+   - Multi-screenshot support
+   - Understands task progression
+   - Looks for success criteria at any point
+   - Combines visual and reasoning evidence
+
+5. **Customizable**
+   - Custom system prompt
+   - Screenshot delay adjustment
+   - Flexible model selection
+
+### Key Files
+
+- **Main Class:** `packages/core/lib/v3Evaluator.ts`
+- **Prompts:** Inline in v3Evaluator.ts (lines 85, 151-183, 237-242)
+- **Schema:** Zod schemas defined in file (lines 24-29)
+
+### Usage Example
+
+```typescript
+// Create evaluator
+const evaluator = new V3Evaluator(
+  v3Instance,
+  "google/gemini-2.5-flash",  // Fast, cheap model
+  { apiKey: process.env.GEMINI_API_KEY }
+);
+
+// Single evaluation with screenshot
+const loginCheck = await evaluator.ask({
+  question: "Is the user successfully logged in as john@example.com?",
+  screenshot: true,
+  screenshotDelayMs: 500  // Wait longer for animations
+});
+
+if (loginCheck.evaluation === "YES") {
+  console.log("Login successful!");
+  console.log("Reasoning:", loginCheck.reasoning);
+}
+
+// Batch evaluation
+const checks = await evaluator.batchAsk({
+  questions: [
+    { question: "Is user logged in?" },
+    { question: "Is dashboard showing?" },
+    { question: "Are notifications visible?" }
+  ],
+  screenshot: true
+});
+
+const allPassed = checks.every(c => c.evaluation === "YES");
+```
+
+---
+
+## Summary
+
+This documentation provides complete coverage of all Stagehand agent execution pipelines:
+
+1. **Extract Pipeline** - Structured data extraction from pages
+2. **Observe Pipeline** - Finding multiple elements without action
+3. **Act Pipeline** - Single action execution with two-step and self-healing
+4. **V3 Agent Pipeline** - Autonomous multi-step goal accomplishment
+5. **Computer Use Agent Pipelines** - Provider-specific direct browser control
+   - Anthropic CUA
+   - OpenAI CUA
+   - Google CUA
+6. **Evaluator Pipeline** - Task completion evaluation with screenshots
+
+Each pipeline is documented with:
+- Clear purpose statement
+- Entry point location
+- ASCII flow diagrams
+- Step-by-step execution details
+- Prompt construction and usage
+- Data transformations
+- Key features and differences
+- Code examples
+- Related files
+
+This documentation enables developers to:
+- Understand how AI prompts flow through the system
+- See how data transforms at each step
+- Choose the right pipeline for their use case
+- Debug issues by following the execution path
+- Extend the system with custom pipelines
+
